@@ -1,0 +1,1155 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from sklearn.pipeline import make_pipeline
+from scipy.stats import norm
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# Create a multibasket objetct
+def create_multibasket(seed, n_stocks, notional=None, strike=None, weights=None):
+    if seed is not None:
+        torch.manual_seed(seed)
+    n = torch.FloatTensor(1).uniform_(1., 10.) if notional is None else notional
+    k = torch.FloatTensor(1).uniform_(1, 1.5) if strike is None else strike
+    w1 = torch.FloatTensor(n_stocks, 1).uniform_()
+    w = w1 / w1.sum() if notional is None else torch.tensor(weights).reshape(n_stocks, 1)
+    return n, k, w
+    
+# Update a multibasket object
+def update_multibasket(seed, basket, w, stock_vols, stock_correl, tgt_bkt_vol=None):
+    if seed is not None:
+        torch.manual_seed(seed)
+    weighted_vols = w * stock_vols
+    bkt_vol = torch.sqrt(torch.linalg.multi_dot([weighted_vols.T, stock_correl, weighted_vols]))
+    tgt = torch.FloatTensor(1).uniform_(0.15, 0.25) if tgt_bkt_vol is None else tgt_bkt_vol
+    ratio = tgt / bkt_vol
+    return basket[0], ratio * basket[1], ratio * basket[2]
+
+
+# ---
+
+
+# DATA CREATING CLASS - PARENT CLASS
+class TeorethicalModel():
+    def __init__(self,
+                 n_baskets,
+                 n_stocks,
+                 maturity,
+                 n_steps,
+                 seed):
+        self.n_baskets = n_baskets
+        self.n_stocks = n_stocks
+        self.maturity = maturity
+        self.n_steps = 1000 * maturity
+        self.seed = seed
+        self.S0 = None
+
+    # Genetare random correlatcion matrix for multi stocks
+    def gen_correl(self):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+        randoms = torch.FloatTensor(2 * self.n_stocks, self.n_stocks).uniform_(-1., 1.)
+        cov = randoms.t() @ randoms
+        invvols = torch.diag(1. / torch.sqrt(torch.diagonal(cov)))
+        return torch.matmul(torch.matmul(invvols, cov), invvols)
+
+
+# BACHELIER CLASS - CHILD CLASS
+class BachelierModel(TeorethicalModel):
+    def __init__(self,
+                 n_baskets,
+                 n_stocks,
+                 maturity,
+                 n_steps,
+                 seed,
+                 baskets = None,
+                 stock_vols = None,
+                 stock_correl = None,
+                 tgt_bkt_vols = None):
+        super().__init__(n_baskets, n_stocks, maturity, n_steps, seed)
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+        
+        # PREPARING MULTIDIM SPACE (2+ STOCKS)
+        self.vols = torch.Tensor(n_stocks, 1).uniform_(0.05, 0.3) if stock_vols is None else torch.tensor(stock_vols).reshape(self.n_stocks, 1)
+        self.correl = self.gen_correl() if stock_correl is None else torch.tensor(stock_correl).reshape(self.n_stocks, self.n_stocks)
+        vT = torch.diag(self.vols.ravel()) * torch.sqrt(torch.tensor(self.maturity))  # original line
+        # vT = torch.diag(self.vols.ravel())
+        self.cov = torch.matmul(torch.matmul(vT, self.correl), vT.t())
+        # self.chol = torch.linalg.cholesky(self.cov) * torch.sqrt(torch.tensor(self.maturity))  # original line
+        self.chol = torch.linalg.cholesky(self.cov)
+        
+        # PREPARING BASKETS SET UP (2+ BASKETS)
+        baskets = [create_multibasket(self.seed, self.n_stocks) for _ in range(self.n_baskets)] if baskets is None else baskets
+        self.bkt_vol = torch.FloatTensor(1).uniform_(0.05, 0.9)  # same for all baskets for simplicity
+        self.baskets = [update_multibasket(self.seed, i, i[2], self.vols, self.correl, j) for i in baskets]
+
+    # From zero, create data by training a MC simulation bases in Bachelier model
+    def generate_data(self,
+                      instrument,
+                      differential,
+                      num_obs):
+        # STARTING INFO
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+        # Adjust lower and upper for dimension
+        self.S0 = torch.Tensor(num_obs, self.n_stocks).uniform_(0.05, 1.95).requires_grad_(True if differential else False)
+        
+        # STARTING SIMULATION - MODELING
+        normals = torch.randn(num_obs, self.n_steps, self.n_stocks)
+        incs = torch.matmul(normals, self.chol.t())
+        S = self.S0.unsqueeze(1) + incs
+        # Initialize dictionaries to store training sets
+        training_set = {}        
+
+        # OPTION INSTRUMENTS
+        pay = torch.zeros((num_obs, 1))
+        deriv = torch.zeros((num_obs, self.n_stocks))
+        for basket in self.baskets:
+            if instrument == 'European call':
+                ST = S[:, -1]
+                bT = torch.matmul(ST, basket[2])
+                pay += torch.maximum(torch.zeros_like(bT), bT - basket[1])
+            elif instrument == 'European put':
+                ST = S[:, -1]
+                bT = torch.matmul(ST, basket[2])
+                pay += torch.maximum(torch.zeros_like(bT), basket[1] - bT)
+            elif instrument == 'American call':
+                ST = S[:, -1]
+                bT = torch.matmul(ST, basket[2])
+                pay += torch.max(torch.zeros_like(bT), bT - basket[1])
+            elif instrument == 'American put':
+                ST = S[:, -1]
+                bT = torch.matmul(ST, basket[2])
+                pay += torch.max(torch.zeros_like(bT), basket[1] - bT)        
+            elif instrument == 'Barrier call':
+                ST = S[:, -1]
+                bT = torch.matmul(ST, basket[2])
+                barrier_pay = torch.zeros_like(bT)
+                barrier_pay[bT > 1] = bT[bT > 1] - basket[1]
+                pay += torch.max(barrier_pay, torch.zeros_like(barrier_pay))        
+            elif instrument == 'Barrier put':
+                ST = S[:, -1]
+                bT = torch.matmul(ST, basket[2])
+                barrier_pay = torch.zeros_like(bT)
+                barrier_pay[bT < 1] = basket[1] - bT[bT < 1]
+                pay += torch.max(barrier_pay, torch.zeros_like(barrier_pay))        
+            else:
+                raise ValueError(f"Instrument '{instrument}' not implemented!")
+        # Store data
+        X = self.S0
+        Y = pay
+        if differential:
+            Y.sum().backward(retain_graph=True)
+            dydx = self.S0.grad
+            training_set["X"] = X
+            training_set["Y"] = Y.reshape(-1, 1)
+            training_set["dYdX"] = dydx
+        else:
+            training_set["X"] = X
+            training_set["Y"] = Y.reshape(-1, 1)
+            training_set["dYdX"] = None
+        return training_set
+    
+    # helper analytics --> DRAW PRICE TARGET POINTS IN RED IN THE GRAPH
+    def bach_price(self,
+                   instrument,
+                   spot,
+                   strike,
+                   vol,
+                   dt):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+        if instrument == 'European call':
+            d = ((spot - strike) / (vol * torch.sqrt(torch.tensor(dt)))).detach().numpy()
+        elif instrument == 'European put':
+            d = ((strike - spot) / (vol * torch.sqrt(torch.tensor(dt)))).detach().numpy()
+        elif instrument == 'American call':
+            # Implement Binomial model here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        elif instrument == 'American put':
+            # Implement Binomial model here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        elif instrument == 'Barrier call':
+            # Implement european call with a barrier value here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        elif instrument == 'Barrier put':
+            # Implement european put with a barrier value here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        else:
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        return vol * torch.sqrt(torch.tensor(dt)) * (d.detach().numpy() * norm.cdf(d.detach().numpy()) + norm.pdf(d.detach().numpy()))
+
+    # helper analytics --> DRAW DELTA TARGET POINTS IN RED IN THE GRAPH
+    def bach_delta(self,
+                   instrument,
+                   spot,
+                   strike,
+                   vol,
+                   dt):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+        if instrument == 'European call':
+            d = (spot - strike) / (vol * torch.sqrt(torch.tensor(dt)))
+        elif instrument == 'European put':
+            d = (strike - spot) / (vol * torch.sqrt(torch.tensor(dt)))
+        elif instrument == 'American call':
+            # Implement Binomial model here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        elif instrument == 'American put':
+            # Implement Binomial model here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        elif instrument == 'Barrier call':
+            # Implement european call with a barrier value here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        elif instrument == 'Barrier put':
+            # Implement european put with a barrier value here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        else:
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        return torch.FloatTensor(norm.cdf(d))
+ 
+    # Uniformly random spots with corresponding baskets, ground true prices and deltas
+    def target_set(self,
+                   instrument,
+                   num_obs):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+        # Adjust lower and upper dimensions
+        spots = torch.Tensor(num_obs, self.n_stocks).uniform_(0.05, 1.95)
+        # Compute baskets, prices and deltas
+        prices = torch.zeros((num_obs, 1))
+        deltas = torch.zeros((num_obs, self.n_stocks))
+        for basket, vol in zip(self.baskets, self.bkt_vol):
+            b0 = torch.matmul(spots, basket[2])
+            prices += self.bach_price(instrument, b0, basket[1], vol, self.maturity)
+            deltas += torch.matmul(self.bach_delta(instrument, b0, basket[1], vol, self.maturity), basket[2].t())
+        return spots, b0, prices, deltas
+    
+    
+# BLACK & SCHOLES CLASS - CHILD CLASS
+class BlackNScholesModel(TeorethicalModel):
+    def __init__(self,
+                 n_baskets,
+                 n_stocks,
+                 maturity,
+                 n_steps,
+                 seed,
+                 baskets = None,
+                 stock_vols = None,
+                 stock_correl = None,
+                 tgt_bkt_vols = None,
+                 vol_mult = 0.015):
+        super().__init__(n_baskets, n_stocks, maturity, n_steps, seed)
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+
+        # PREPARING MULTIDIM SPACE (2+ STOCKS)
+        self.vol_mult = (vol_mult * self.n_stocks + 0.0025 * self.n_stocks**2 - 0.0002 * self.n_stocks**3) * torch.sqrt(torch.Tensor(self.maturity))
+        self.vols = torch.Tensor(n_stocks, 1).uniform_(0.05, 0.15) if stock_vols is None else torch.tensor(stock_vols).reshape(self.n_stocks, 1)
+        self.correl = self.gen_correl() if stock_correl is None else torch.tensor(stock_correl).reshape(n_stocks, n_stocks)
+        vT = torch.diag(self.vols.ravel()) * torch.sqrt(torch.tensor(self.maturity))  # original line
+        # vT = torch.diag(self.vols.ravel())
+        self.cov = torch.matmul(torch.matmul(vT, self.correl), vT.t())
+        self.chol = torch.linalg.cholesky(self.cov) * torch.sqrt(torch.tensor(self.maturity))  # original line
+        # self.chol = torch.linalg.cholesky(self.cov)
+        
+        # PREPARING BASKETS SET UP (2+ BASKETS)
+        baskets = [create_multibasket(self.seed, self.n_stocks) for _ in range(self.n_baskets)] if baskets is None else baskets
+        self.bkt_vol = torch.FloatTensor(1).uniform_(0.25, 0.35)  # same for al baskets for simplicity
+        self.baskets = [update_multibasket(self.seed, i, i[2], self.vols, self.correl, j) for i in baskets]
+                               
+    # From zero, create data by training a MC simulation bases in Bachelier model
+    def generate_data(self,
+                      instrument,
+                      differential,
+                      num_obs):
+        # SET UP TRAINING INFO
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+        # Adjust lower and upper for dimension
+        self.S0 = torch.Torch(num_obs, self.n_stocks).uniform_(0.05, 1.95).requires_grad_(True if differential else False)
+
+        # START SIMULATION
+        returns = torch.randn(2, num_obs, self.n_stocks)  # 2 sets of normal returns
+        vol0 = torch.stack([bkt_vol * self.vol_mult for bkt_vol in self.bkt_vol])
+        R1 = torch.exp(-0.5 * vol0.clone().detach() * vol0.clone().detach() + vol0.clone().detach() * returns[0, :])
+        R2 = torch.exp(-0.5 * self.bkt_vol * self.bkt_vol * self.maturity + self.bkt_vol * torch.sqrt(torch.tensor(self.maturity)) * returns[1, :])
+        S1 = self.S0 * R1
+        S2 = S1 * R2
+        # Initialize dictionaries to store training sets
+        training_set = {}        
+
+        # OPTION INSTRUMENTS
+        pay = torch.zeros((num_obs, 1))
+        deriv = torch.zeros((num_obs, self.n_stocks))
+        for basket in self.baskets:
+            if instrument == 'European call':
+                ST = S[:, -1]
+                bT = torch.matmul(ST, basket[2])
+                pay += torch.maximum(torch.zeros_like(bT), bT - basket[1])
+            elif instrument == 'European put':
+                ST = S[:, -1]
+                bT = torch.matmul(ST, basket[2])
+                pay += torch.maximum(torch.zeros_like(bT), basket[1] - bT)
+            elif instrument == 'American call':
+                ST = S[:, -1]
+                bT = torch.matmul(ST, basket[2])
+                pay += torch.max(torch.zeros_like(bT), bT - basket[1])
+            elif instrument == 'American put':
+                ST = S[:, -1]
+                bT = torch.matmul(ST, basket[2])
+                pay += torch.max(torch.zeros_like(bT), basket[1] - bT)        
+            elif instrument == 'Barrier call':
+                ST = S[:, -1]
+                bT = torch.matmul(ST, basket[2])
+                barrier_pay = torch.zeros_like(bT)
+                barrier_pay[bT > 1] = bT[bT > 1] - basket[1]
+                pay += torch.max(barrier_pay, torch.zeros_like(barrier_pay))        
+            elif instrument == 'Barrier put':
+                ST = S[:, -1]
+                bT = torch.matmul(ST, basket[2])
+                barrier_pay = torch.zeros_like(bT)
+                barrier_pay[bT < 1] = basket[1] - bT[bT < 1]
+                pay += torch.max(barrier_pay, torch.zeros_like(barrier_pay))        
+            else:
+                raise ValueError(f"Instrument '{instrument}' not implemented!")
+        # Store data
+        X = self.S0
+        Y = pay
+        if differential:
+            Y.sum().backward(retain_graph=True)
+            dydx = self.S0.grad
+            training_set["X"] = X
+            training_set["Y"] = Y.reshape(-1, 1)
+            training_set["dYdX"] = dydx
+        else:
+            training_set["X"] = X
+            training_set["Y"] = Y.reshape(-1, 1)
+            training_set["dYdX"] = None
+        return training_set
+
+    # helper analytics --> DRAW PRICE TARGET POINTS IN RED IN THE GRAPH
+    def bs_price(self,
+                 instrument,
+                 spot,
+                 strike,
+                 vol,
+                 dt):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+        if instrument == 'European call':
+            d1 = (torch.log(spot / strike) + 0.5 * vol * vol * dt) / (vol * torch.sqrt(torch.tensor(dt)))
+            d2 = (d1 - vol * torch.sqrt(torch.tensor(dt))).detach.numpy()
+            return spot * torch.tensor(norm.cdf(d1.detach().numpy())) - strike * torch.tensor(norm.cdf(d2))
+        elif instrument == 'European put':
+            d1 = (torch.log(spot / strike) + 0.5 * vol * vol * dt) / (vol * torch.sqrt(torch.tensor(dt)))
+            d2 = (d1 - vol * torch.sqrt(torch.tensor(dt))).detach.numpy()
+            return strike * torch.tensor(norm.cdf(-d2)) - spot * torch.tensor(norm.cdf(-d1.detach().numpy()))
+        elif instrument == 'American call':
+            # Implement Binomial model here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        elif instrument == 'American put':
+            # Implement Binomial model here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        elif instrument == 'Barrier call':
+            # Implement european call with a barrier value here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        elif instrument == 'Barrier put':
+            # Implement european put with a barrier value here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        else:
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+
+    # helper analytics --> DRAW DELTA TARGET POINTS IN RED IN THE GRAPH
+    def bs_delta(self,
+                 instrument,
+                 spot,
+                 strike,
+                 vol,
+                 dt):
+        if instrument == 'European call':
+            d = (torch.log(spot / strike) + 0.5 * vol * vol * T) / (vol * torch.sqrt(torch.tensor(dt)))
+        elif instrument == 'European put':
+            d = (torch.log(strike / spot) + 0.5 * vol * vol * T) / (vol * torch.sqrt(torch.tensor(dt)))
+        elif instrument == 'American call':
+            # Implement Binomial model here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        elif instrument == 'American put':
+            # Implement Binomial model here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        elif instrument == 'Barrier call':
+            # Implement european call with a barrier value here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        elif instrument == 'Barrier put':
+            # Implement european put with a barrier value here
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        else:
+            raise ValueError(f"Instrument '{instrument}' not implemented!")
+        return torch.FloatTensor(norm.cdf(d.detach().numpy()))
+
+    # Uniformly random spots with corresponding baskets, ground true prices and deltas
+    def target_set(self,
+                   instrument,
+                   num_obs):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+        # Adjust lower and upper dimensions
+        spots = torch.Torch(num_obs, self.n_stocks).uniform_(0.05, 1.95)
+        # Compute baskets, prices and deltas
+        prices = torch.zeros((num_obs, 1))
+        deltas = torch.zeros((num_obs, self.n_stocks))
+        for basket, vol in zip(self.baskets, self.bkt_vol):
+            b0 = torch.matmul(spots, basket[2])
+            prices += self.bs_price(instrument, b0, basket[1], vol, self.maturity)
+            deltas += torch.matmul(bs_delta(instrument, b0, basket[1], vol, self.maturity), basket[2].t())
+        return spots, b0, prices, deltas
+
+
+
+# ---
+
+               
+# DIFF PCA CLASS
+class DiffPCA():
+    def __init__(self,
+                 n_components = None,
+                 central = False):
+        self.central = central
+        self.n_components = n_components
+        self.select_n_components = None
+        self.relevant_components = None
+
+    # Select relevant data
+    def fit(self,
+            x,
+            dydx,
+            y = None):
+        # If central, avg differentials
+        central_means = torch.sum(dydx, dim=0) / torch.numel(dydx)
+        # Compute cov matrix of diffs
+        dydx2 = dydx - central_means if self.central else dydx
+        cov = torch.matmul(dydx.T, dydx) / x.size(0)
+        # Eigenvalues decomposition
+        d, P = torch.linalg.eis(cov)
+        # Reverse order to largest eigenvalues come first
+        d_values, d_indexes = d.sort(descending=True)
+        P_values, P_indexes = P.sort(descending=True)
+        d_sum = torch.cumsum(d_values, dim=0)
+        total_variance = d_sum[-1]
+        # Find number of principal components
+        if self.n_components is not None:
+            # n_components is larger than 1 = number of components
+            if self.n_components >= 1:
+                self.select_n_components = self.n_components
+            # n_components is smaller then 1 = square magnitude explained    
+            else:
+                d_sum = d_sum / total_variance
+                self.select_n_components = torch.seachsorted(d_sum, self.n_components) + 1
+        else:
+            self.select_n_components = min(x.size(0), x.sisze(1))
+        explained = d_sum[self.select_n_components - 1]
+        unexplained = total_variance - explained
+        # Filter irrelevant components
+        d2 = d_values[:self.select_n_components]
+        P2 = P_values[:, :self.select_n_components]
+        # Results and attributes
+        self.relevant_components = P2.T  # select_n_components axes of relevance, orthogonal unit vectors sorted by decreasing values
+        explained_variance = d2  # the relevance (gradient magnitude) of the select_n_component principal axes
+        expained_variance_ratio = d2 / total_variance
+        singular_values = torch.sqrt(d2)  # vector of dimension select_n_components + sqrt(explained_variance)
+        noise_variance = unexplained
+        return self.select_n_components, self.relevant_components
+        
+    # Transform inputs and derivatives
+    def transform(self,
+                  x,
+                  dydx=None):
+        x_transf = torch.matmul(x, self.relevant_components.T)
+        if dydx is None:
+            return x_transf
+        else:
+            dydx_transf = torch.matmul(dydx, self.relevant_components.T)
+        return x_transf, dydx_transf
+        
+    # Reverse transformations
+    def inserve_transform(self,
+                          x_transf,
+                          dydx_transf=None):
+        x = torch.matmul(x_transf, self.relevant_components)
+        if dydx_transf is None:
+            return x
+        else:
+            dydx = torch.matmul(dydx_transf, self.relevant_components)
+        return x, dydx
+
+    # Select and transform relevant data
+    def fit_transform(self,
+                      x,
+                      dydx,
+                      y=None):
+        self.fit(x, dydx, y)
+        return self.transform(x, dydx)
+
+
+# PREPROCESSING STEPS
+# Apply Diff PCA to reduce data size
+def apply_diff_pca(theoretical_model,
+                   instrument,
+                   differential,
+                   size,
+                   baskets = None,
+                   stock_vols = None,
+                   stock_correl = None,
+                   deltidx = 0):
+    if theoretical_model.seed is not None:
+        torch.manual_seed(theoretical_model.seed)
+    # CHANGE TRAIN DATA
+    training_set = theoretical_model.generate_data(instrument, differential, size)
+    x, dydx = training_set["X"], training_set["dYdX"]
+    epsilon = 0.00000001
+    dpca = diff_pca(1.0 - epsilon)
+    # x, dydx representation in low dimension
+    x_pca, dydx_pca = dpca.fit_transform(x, dydx)
+    # Checking dim reduction
+    print("    INPUT DIMENSION:")
+    print(f"    Before: {x.size(1)}, After: {x_pca.size(1)}")
+    print("    DYDX DIMENSION:")
+    print(f"    Before: {dydx.size(1)}, After: {dydx_pca.size(1)}\n")
+    
+    # CHANGE TARGET DIMENSION
+    new_dimension = x_pca.size(1)
+    spots_pca = torch.Tensor(size, new_dimension).uniform_(0.05, 1.95)
+    prices = torch.zeros((size, 1))
+    deltas = torch.zeros((size, new_dimension))
+    # Gen correl for new dimention
+    randoms = torch.FloatTensor(2 * new_dimension, new_dimension).uniform_(-1., 1.)
+    cov = randoms.t() @ randoms
+    invvols = torch.diag(1. / torch.sqrt(torch.diagonal(cov)))
+    correl = torch.matmul(torch.matmul(invvols, cov), invvols) if stock_correl is None else torch.tensor(stock_correl).reshape(new_dimension, new_dimension)
+    
+    # PREPARING MULTIDIM SPACE (2+ STOCKS)
+    vols = torch.Tensor(new_dimension, 1).uniform_(0.05, 0.5) if stock_vols is None else torch.tensor(stock_vols).reshape(new_dimension, 1)
+    vT = torch.diag(self.vols.ravel()) * torch.sqrt(torch.tensor(self.maturity))
+    # PREPARING BASKETS SET UP (2+ BASKETS)
+    cr_baskets = [create_multibasket(theoretical_model.seed, new_dimension) for _ in range(theoretical_model.n_baskets)] if baskets is None else baskets
+    bkt_vol = torch.FloatTensor(1).uniform_(0.15, 0.25)  # same for al baskets for simplicity 
+    up_baskets = [update_multibasket(theoretical_model.seed, i, i[2], self.vols, self.correl, j) for i in cr_baskets]
+
+    # Change Bachelier's targets
+    if type(theoretical_model).__name__ == "BachelierModel":
+        for basket in up_baskets:
+            b0 = torch.matmul(spots, basket[2])
+            prices += theoretical_model.bach_price(instrument, b0, basket[1], bkt_vol, theoretical_model.maturity)
+            deltas += torch.matmul(theoretical_model.bach_delta(instrument, b0, basket[1], bkt_vol, theoretical_model.maturity), basket[2].t())
+    # Change Black &  Scholes's targets
+    if type(theoretical_model).__name__ == "BlackNScholesModel":
+        for basket in up_baskets:
+            b0 = torch.matmul(spots, basket[2])
+            prices += theoretical_model.bs_price(instrument, b0, basket[1], bkt_vol, theoretical_model.maturity)
+            deltas += torch.matmul(theoretical_model.bs_delta(instrument, b0, basket[1], bkt_vol, theoretical_model.maturity), basket[2].t())
+    return dpca, x_pca, dydx_pca, spots, b0, prices, deltas
+    
+    
+# ---
+    
+
+# If we want to work with e learnable parameter in the future, learnable beta of softbeta activation function
+class LearnableSoftplus(nn.Module):
+    def __init__(self, initial_beta):
+        super(LearnableSoftplus, self).__init__()
+        self.soft_beta = nn.Parameter(torch.tensor(initial_beta))
+        
+    def forward(self, x):
+        return torch.log(1 + torch.exp(self.soft_beta * x)) / self.soft_beta
+
+
+# NN CLASS TO TRAIN AND SIMULATE DATA
+class NeuralApproximator(nn.Module):
+    def __init__(self,
+                 x,
+                 y,
+                 dydx,
+                 differential,
+                 input_dim,
+                 output_dim,
+                 weight_init_type,
+                 hidden_units,
+                 soft_beta,
+                 optim,
+                 seed):
+        super(NeuralApproximator, self).__init__()
+        self.x = x
+        self.y = y
+        self.dydx = dydx
+        self.differential = differential
+        self.seed = seed
+        
+        # Build model
+        self.input_layer = nn.Linear(input_dim, hidden_units[0])
+        self.hidden_layers = nn.ModuleList([nn.Linear(hidden_units[i], hidden_units[i+1]) for i in range(len(hidden_units)-1)])
+        self.output_layer = nn.Linear(hidden_units[-1], output_dim)
+        
+        # Weight-bias initialization
+        self.weights_init = weight_init_type
+        self.apply(self.weight_bias_initialization)
+        
+        # Others model parameters
+        self.activation = nn.Softplus(beta=soft_beta)
+        # self.activation = LeaLearnableSoftplus(initial_beta=soft_beta)
+        self.optimizer = optim
+        self.criterion = nn.MSELoss()
+        self.lam = 1.0 / self.x.size(1)  # mantain 50%-50% learning between STDD and DIFF        
+        self.lam = 1.0  # increase diff learning for bigger dimension
+
+        # Hyperparameters
+        if self.differential:
+            # self.dydx_norm = torch.abs(self.dydx) * torch.std(x) / torch.std(y)
+            # self.lambda_j = self.lam / torch.sqrt((self.dydx_norm.detach() ** 2).mean(axis=0)).reshape(1, -1)
+            self.lambda_j = self.lam / torch.sqrt((self.dydx.detach() ** 2).mean(axis=0)).reshape(1, -1)
+            self.alpha = 1.0 / (1.0 + self.lam * x.size(1))
+            self.beta = 1.0 - self.alpha
+
+    def forward(self, x):
+        # Input layer, if ReLU, not necessary to apply activation function
+        if self.activation == nn.ReLU:
+            z = self.input_layer(x)
+        else:
+            z = self.activation(self.input_layer(x))
+        # Hidden layers
+        for hidden_layer in self.hidden_layers:
+            z = self.activation(hidden_layer(z))
+        # Output layer
+        z = self.activation(self.output_layer(z))
+        return z
+
+    def predict(self, x):
+        with torch.no_grad():
+            return self.forward(x)
+        
+    def weight_bias_initialization(self, module):
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+        if isinstance(module, nn.Linear):
+            # Bias initialization as zero
+            nn.init.constant_(module.bias, 0)
+            # Choosing weights initialization
+            if self.weights_init == 'const':
+                nn.init.constant_(module.weight, 0.05)
+            elif self.weights_init == 'unif':
+                nn.init.uniform_(module.weight, a=-0.1, b=0.1)
+            elif self.weights_init == 'norm':
+                nn.init.normal_(module.weight, mean=0, std=0.075)
+            elif self.weights_init == 'xavier_unif':
+                nn.init.xavier_uniform_(module.weight, gain=nn.init.calculate_gain('relu'))
+            elif self.weights_init == 'xavier_norm':
+                nn.init.xavier_normal_(module.weight)
+            elif self.weights_init == 'kaiming_unif':
+                nn.init.kaiming_uniform_(module.weight, mode='fan_in', nonlinearity='relu')
+            elif self.weights_init == 'kaiming_norm':
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+
+    def fit(self,
+            early,
+            n_epochs,
+            batches_per_epoch = 16,
+            min_batch_size = 256,
+            lr_schedule = ((0.0, 1.0e-8), (0.2, 0.1), (0.6, 0.01), (0.9, 1.0e-6), (1.0, 1.0e-8)),
+            best_loss = float('inf'),
+            patience = 50,
+            min_delta = 0):
+        # Set up fit method
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+        loss_values = []
+        batch_size = max(min_batch_size, self.x.size(0) // batches_per_epoch)
+        lr_schedule_epochs, lr_schedule_rates = zip(*lr_schedule)
+        counter = 0
+        # Run epochs
+        for epoch in range(n_epochs):
+            learning_rate = np.interp(epoch / n_epochs, lr_schedule_epochs, lr_schedule_rates)
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = learning_rate
+            batch_losses = []
+            # Run data batches
+            for batch_start in range(0, self.x.size(0), batch_size):
+                batch_end = min(batch_start + batch_size, self.x.size(0))
+                input = self.x[batch_start:batch_end].clone().detach().requires_grad_(True if self.differential else False)
+                label = self.y[batch_start:batch_end].clone().detach()
+                # Training itself
+                if self.differential:
+                    dydx_batch = self.dydx[batch_start:batch_end].clone().detach()
+                    output = self.forward(input)
+                    # output.sum().backward(retain_graph=True, create_graph=True)
+                    # diff_output = input.grad
+                    diff_output = torch.autograd.grad(output.sum(), input, retain_graph=True, create_graph=True, allow_unused=True)[0]
+                    loss = self.alpha * self.criterion(output, label) + self.beta * self.criterion(diff_output * self.lambda_j, dydx_batch * self.lambda_j)
+                else:
+                    output = self.forward(input)
+                    loss = self.criterion(output, label)
+                batch_losses.append(loss.item())
+                # Reset weight grads wrt inputs and finishes the training calculating grads wrt loss
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                # Early stopping mechanism
+                if early:
+                    if loss.item() < best_loss - min_delta:
+                        best_loss = loss.item()
+                        counter = 0
+                    else:
+                        counter += 1
+                        if counter >= patience:
+                            print(f"Early stopping in action at epoch {epoch}!")
+                            break
+            # Store epoch losses
+            loss_values.append(np.mean(batch_losses))
+        return loss_values
+
+
+
+# AUXILIAR TRAIN-TEST METHODS
+# Generate explicit target set
+def generate_target_set(theoretical_model,
+                        instrument,
+                        size):
+    spots, baskets, prices, deltas = theoretical_model.target_set(instrument, size)
+    return spots, baskets, prices, deltas
+
+
+# Generate explicit train data
+def generate_training_set(theoretical_model,
+                          instrument,
+                          differential,
+                          size,
+                          deltidx = 0):
+    training_set = theoretical_model.generate_data(instrument, differential, size)
+    x, y, dydx = training_set["X"], training_set["Y"], training_set["dYdX"]
+    return x, y, dydx
+
+
+# Training generated values
+def train_model(x,
+                y,
+                dydx,
+                differential,
+                w_init,
+                input_dim,
+                output_dim,
+                neurons,
+                n_epochs,
+                soft_beta,
+                optim,
+                seed,
+                early = False,
+                deltidx = 0):
+    model = NeuralApproximator(x, y, dydx, differential, input_dim, output_dim, w_init, neurons, soft_beta, optim, seed)
+    loss_values = model.fit(early, n_epochs)
+    return model, loss_values
+    
+
+# ---
+ 
+
+# PLOTTING GRAPHS
+def graph_all(n_baskets,
+              x_values,
+              y_targets,
+              y_predictions,
+              diff_i,
+              sizes,
+              n_epochs,
+              loss_values,
+              title):
+    # Set up visualization
+    n_rows = len(diff_i)
+    n_cols = 3
+    fig, ax = plt.subplots(n_rows, n_cols, figsize=(13, 7), squeeze=False)
+    # Loop each state
+    states = ["Differential", "Standard"]
+    for i, j in enumerate(states):
+        ax[i][0].annotate(f"Size {sizes[0]}", xy=(0, 0.3), xytext=(-ax[i, 0].yaxis.labelpad - 5, 0),
+                          xycoords=ax[i, 0].yaxis.label, textcoords='offset points', ha='right', va='center')
+        ax[i][0].annotate(f"{j}", xy=(0, 0.7), xytext=(-ax[i, 0].yaxis.labelpad - 5, 0),
+                          xycoords=ax[i, 0].yaxis.label, textcoords='offset points', ha='right', va='center')
+        # Calculate errors
+        errors = 100 * (y_predictions[i] - y_targets)
+        rmse = torch.sqrt((errors.detach() ** 2).mean()).item()
+        # Plot X-Y results
+        ax[i][0].scatter(100 * x_values.detach().numpy(), 100 * y_predictions[i].detach().numpy(), s=2.5, color='c', label='Predicted')
+        ax[i][0].scatter(100 * x_values.detach().numpy(), 100 * y_targets.detach().numpy(), s=1, color='r--', label='Targets')
+        ax[i][0].set_xlabel(f"S0 --- RMSE {rmse:.4f}")
+        ax[i][0].set_ylabel("Payoff")
+        ax[i][0].legend(prop={'size':0}, loc='upper left')
+        # Plot Y-Y_pred results
+        ax[i][1].scatter(100 * y_targets.detach().numpy(), 100 * y_predictions[i].detach().numpy(), s=2.5, color='co', markersize=2, label='Predicted')
+        ax[i][1].scatter(100 * y_targets.detach().numpy(), 100 * y_targets.detach().numpy(), s=1, color='r--', label='Ground truth')
+        ax[i][1].set_xlabel(f"True prices --- RMSE {rmse:.4f}")
+        ax[i][1].set_ylabel("Predicted prices")
+        ax[i][1].legend(prop={'size':0}, loc='upper left')
+        # Plot loss per epoch
+        ax[i][2].plot(range(n_epochs), loss_values[i], label='Loss per epoch')
+        ax[i][2].set_xlabel(f"Epochs --- Final loss: {round(loss_values[i][-1], 3)}")
+        ax[i][2].set_ylabel("Loss value")
+        ax[i][2].legend(prop={'size':0}, loc='upper left')
+    # Other graph features
+    plt.suptitle(f"{title}", fontsize=16)
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.9)
+    plt.show()
+
+    
+# Standard and differential for 2 sizes
+def graph_compare(n_baskets,
+                  x_values,
+                  y_targets,
+                  y_predictions,
+                  rmses,
+                  diff_i,
+                  sizes_compare,
+                  n_epochs,
+                  title):
+    # Set up visualization
+    n_rows = len(sizes_compare)
+    n_cols = len(diff_i)
+    states = ["Differential", "Standard"]
+    fig, ax = plt.subplots(n_rows, n_cols, figsize=(10, 7), squeeze=False)
+    # Set plot subplots title
+    for i in range(len(sizes_compare)):
+        for j in range(len(states)):
+            ax[i][j].annotate(f"{'Differential' if j == 0 else 'Standard'} {sizes_compare[i]}", xy=(0.5, 1.02), xytext=(0, 3),
+                              xycoords=ax[i, j].transAxes, textcoords='offset points', ha='center', va='bottom', fontsize='bold')                   
+    # Loop to set each size and state
+    for i, j in enumerate(status):
+        # Plot X-Y results for SIZE 1
+        ax[0][i].scatter(100 * x_values[0].detach().numpy(), 100 * y_predictions[i].detach().numpy(), s=2.5, color='c', label='Predicted')
+        ax[0][i].scatter(100 * x_values[0].detach().numpy(), 100 * y_targets[0].detach().numpy(), s=1, color='r--', label='Targets')
+        ax[0][i].set_xlabel(f"S0 --- RMSE {rmse:.4f}")
+        ax[0][i].set_ylabel("Payoff")
+        ax[0][i].legend(prop={'size':0}, loc='upper left')
+        # Plot X-Y results for SIZE 2
+        ax[1][i].scatter(100 * x_values[1].detach().numpy(), 100 * y_predictions[i].detach().numpy(), s=2.5, color='c', label='Predicted')
+        ax[1][i].scatter(100 * x_values[1].detach().numpy(), 100 * y_targets[1].detach().numpy(), s=1, color='r--', label='Targets')
+        ax[1][i].set_xlabel(f"S0 --- RMSE {rmse:.4f}")
+        ax[1][i].set_ylabel("Payoff")
+        ax[1][i].legend(prop={'size':0}, loc='upper left')
+    # Other graph features
+    plt.suptitle(f"{title}", fontsize=16)
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.9)
+    plt.show()
+
+                   
+# Standard and differential RSME values for 2 sizes
+# Standard and differential for 2 sizes
+def graph_rsme(diff_rmses_1024,
+               diff_rmses_8192,
+               stdd_rmses_1024,
+               stdd_rmses_8192,
+               n_stocks,
+               title):
+    # Set up visualization
+    n_rows = 1
+    n_cols = 3
+    fig, ax = plt.subplots(n_rows, n_cols, figsize=(16, 4.5), squeeze=False)
+    # RSME for each size and state
+    # Plot X-Y results for SIZE 1
+    ax[0, 0].set_title("RSMEs for each model and size", fontsize=10, fontweight='bold')
+    ax[0, 0].plot(diff_rmses_8192, color='skyblue', label='Diff 8192')
+    ax[0, 0].plot(diff_rmses_1024, color='b', label='Diff 1024')
+    ax[0, 0].plot(stdd_rmses_8192, color='r', label='Stdd 8192')
+    ax[0, 0].plot(stdd_rmses_1024, color='lightcoral', label='Stdd 1024')
+    ax[0, 0].xaxis.set_major_locator(MultipleLocator(n_stocks/10))
+    ticks0 = ax[0, 0].get_xticks()[1:] - 1
+    ax[0, 0].set_xticks(ticks0)
+    ax[0, 0].set_xlim(left=-n_stocks/20)
+    ax[0, 0].set_ylim(bottom=0)
+    ax[0, 0].set_xlabel("Stocks")
+    ax[0, 0].set_ylabel("RMSE")
+    ax[0, 0].legend(low="upper right", prop={'size':0})
+
+    # Compartison between models
+    difference_1024 = []
+    difference_8192 = []
+    major_difference = []
+    for i in range(len(diff_rmses_1024)):
+        difference_1024.append(round(((diff_rmses_1024[i] - stdd_rmses_1024[i]) / stdd_rmses_1024[i]).item, 3))
+        difference_8192.append(round(((diff_rmses_8192[i] - stdd_rmses_8192[i]) / stdd_rmses_8192[i]).item, 3))
+        major_difference.append(round(((diff_rmses_1024[i] - stdd_rmses_8192[i]) / stdd_rmses_8192[i]).item, 3))
+    ax[0, 1].set_title("Diff advantage over Stdd (%)", fontsize=10, fontweight='bold')
+    ax[0, 1].plot(difference_1024, color='silver', label='Diff 1024')
+    ax[0, 1].plot(difference_8192, color='dimgrey', label='Diff 8192')
+    ax[0, 1].axhline(y=0, color='r', linestyle='--')
+    ax[0, 1].xaxis.set_major_locator(MultipleLocator(n_stocks/10))
+    ax[0, 1].set_xticks(ticks0)
+    ax[0, 1].set_xtickslabels([int(tick)+1 for tick in ticks0])
+    ax[0, 1].set_xlim(left=-n_stocks/20)
+    ax[0, 1].set_xlabel("Stocks")
+    ax[0, 1].set_ylabel("RMSE % difference")
+    ax[0, 1].legend(low="upper right", prop={'size':0})
+
+    # Comparison between diff 1024 and stdd 8192
+    ax[0, 2].set_title("Diff 1024 advantage over Stdd 8192 (%)", fontsize=10, fontweight='bold')
+    ax[0, 2].plot(major_difference, color='black')
+    ax[0, 2].axhline(y=0, color='r', linestyle='--')
+    ax[0, 2].xaxis.set_major_locator(MultipleLocator(n_stocks/10))
+    ax[0, 2].set_xticks(ticks0)
+    ax[0, 2].set_xtickslabels([int(tick)+1 for tick in ticks0])
+    ax[0, 2].set_xlim(left=-n_stocks/20)
+    ax[0, 2].set_xlabel("Stocks")
+    ax[0, 2].set_ylabel("RMSE % difference")
+    
+    # Other graph features
+    plt.suptitle(f"{title}", fontsize=16)
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.9)
+    plt.show()
+
+
+# Plot diff pca graph
+def graph_polyreg_after_dpca(dpca,
+                             x_pca,
+                             y_train,
+                             spots,
+                             prices,
+                             mean_norm,
+                             std_norm,
+                             title):
+    # Create polynomial structure
+    poly_reg = make_pipeline(PolynomialFeatures(degree=5),
+                             StandardScaler(with_mean=mean_norm, with_std=std_norm),
+                             LinearRegression())
+    poly_reg.fit(x_pca.detach().numpy(), y_train.detach().numpy())
+    y_pred = poly_reg.predict(dpca.transform(spots))
+    # Calculate errors
+    erros = 100 * (prices - y_pred)
+    rmse = torch.sqrt((errors.detach() ** 2).mean()).item()
+    # Plot results
+    plt.figure()
+    plt.plot(prices, y_pred, 'co', markerfacecolor='white', label='predicted')
+    plt.plot(prices, prices, 'r--', label='ground truth')
+    plt.xlabel(f"True prices -- RMSE {rmse:.4f}")
+    plt.ylabel("Predicted prices")
+    plt.legend()
+    plt.title(f"{title}", fontsize=16)
+
+
+# Instanciate problem
+if __name__ == "__main__":
+    
+    xxx = 20
+    for n_stocks in range(xxx, xxx+1):
+        
+        mode = {0: 'individual_simulations',
+                1: 'df_many_scenarios'
+               }
+        
+        save_results = False
+        
+        if mode == 'individual_simulations':
+            
+            # VARIABLES OF CHOICE
+            n_simul = [1024, 2048, 8192][0]
+            n_simul_compare = [1024, 8192]
+            n_baskets = 1
+            # n_stocks = 3
+            maturity = 1
+            n_steps = 1000 * maturity
+            n_epochs = 200
+            neurons = (20, 20, 20, 20)
+            seed = 4321
+            diff_i = [True, False]
+
+            # Analytical equation to generate data with MC
+            theo_model = {0: BachelierModel(n_baskets, n_stocks, maturity, n_steps, seed),
+                          1: BlackNScholesModel(n_baskets, n_stocks, maturity, n_steps, seed)
+                         }[0]
+            # Option instrument to calculate payoff before training
+            instrument = {0: "European call",
+                          1: "European put"
+                         }[0]
+            # Weight initialization
+            w_init = {0: "const",
+                      1: "unif",
+                      2: "norm",
+                      3: "xavier_unif",
+                      4: "xavier_norm",
+                      5: "kaiming_unif",
+                      6: "kamining_norm"  # DEFAULT
+                     }[6]
+            # Optimizers
+            optimizer = {0: optim.Adam,  #DEFAULT
+                         1: optim.Adamax,
+                         2: optim.Adadelta,
+                         3: optim.Adagrad,
+                         4: optim.NAdam
+                        }[0]
+            # Diff PCA to reduce dimensionality
+            apply_dpca = {0: False,
+                          1: True
+                         }[0]
+            # Kind of plot
+            plot_graph = {0: "both_model_1_size",
+                          1: "both_model_2_sizes"
+                         }[1]
+
+            # Printing start simulation            
+            print(f"--> Simulation seed::  {seed}")
+            print(f"--> Number of baskets: {n_baskets}")
+            print(f"--> Stocks per basket: {n_stocks}")
+            print(f"--> Basket maturity:   {n_stocks}")
+            
+            # Preprocessing diff pca scenarios
+            if apply_dpca: 
+                # Generate data
+                print("--> Initializing data...")
+                x_tr, y_tr, dydx_tr = generate_training_set(theo_model, instrument, True, n_simul)
+                # Compute targets
+                print("--> Computing targets...")
+                spots, baskets, prices, deltas = generate_target_set(theo_model, instrument, n_simul)
+                # Apply diff pca itself
+                print(f"--> Apply Diff PCA...\n")
+                dpca, x_pca, dydx_pca, spots_pca, baskets, prices, delta_pca = apply_diff_pca(theo_model, instrument, True, n_simul)
+                n_stocks_pca = x_pca.size(1)
+                # Train data and compute loss
+                print(f"--> Training DIFF data...")
+                # Soft beta for training post-diff PCA
+                if n_stocks_pca <= 11:
+                    soft_beta = 3.05 - 0.05 * n_stocks_pca
+                elif 12 <= n_stocks_pca <= 25:
+                    soft_beta = 3.1 - 0.1 * n_stocks_pca
+                else:
+                    soft_beta = 0.5
+                diff_model_pca, diff_loss = train_model(x_pca, y_tr, dydx_pca, True, w_init, x_pca.size(1), y_tr.size(1), neurons, n_epochs, soft_beta, optimizer, seed)
+                # Predict data
+                print(f"--> Predicting data...")
+                diff_pred_pca = diff_model_pca.predict(spots_pca)
+                # Calculate RMSE
+                diff_rmse = torch.sqrt(((diff_pred_pca - prices) ** 2).mean())
+                # Plot final graph  
+                graph_each(n_baskets, baskets, prices, diff_pred_pca, [n_simul], n_epochs, diff_loss, f"{type(theo_model).__name__} - From {n_stocks} to {n_stocks_pca} dim - DIFF - {instrument} {maturity}y maturity")
+                # graph_polyreg_after_dpca(dpca, x_pca, y_tr, spots, prices, True, True, "teste poly")
+            else:
+                # Soft beta for training
+                if n_stocks <= 11:
+                    soft_beta = 3.05 - 0.05 * n_stocks
+                elif 12 <= n_stocks <= 25:
+                    soft_beta = 3.1 - 0.1 * n_stocks
+                else:
+                    soft_beta = 0.5
+                # Different plots
+                if plot_graph == "both_model_1_size":
+                    # Generate data
+                    print("--> Initializing data...")
+                    x_tr, y_tr, dydx_tr = generate_training_set(theo_model, instrument, True, n_simul)
+                    # Compute targets
+                    print("--> Computing targets...")
+                    spots, baskets, prices, deltas = generate_target_set(theo_model, instrument, n_simul)
+                    # Train data, compute loss, predict data and calculate RMSE
+                    all_losses = []
+                    all_preds = []
+                    all_rmses = []
+                    print(f"--> Training data...")
+                    print(f"--> Predicting data...")
+                    for i in diff_i:
+                        model_i, loss_i = train_model(x_tr, y_tr, dydx_tr, i, w_init, x_tr.size(1), y_tr.size(1), neurons, n_epochs, soft_beta, optimizer, seed)
+                        pred_i = model_i.predict(spots)
+                        rmse_i = torch.sqrt(((pred_i - prices) ** 2).mean())
+                        all_losses.append(loss_i)
+                        all_preds.append(pred_i)
+                        all_rmses.append(rmse_i)
+                    # Plot final results
+                    graph_all(n_baskets, baskets, prices, all_preds, diff_i, [n_simul], n_epochs, all_losses, f"{type(theo_model).__name__} - {n_baskets} baskets - {n_stocks} stocks each bkt - {instrument} {maturity}y maturity")    
+                else:
+                    all_baskets = []
+                    all_prices = []
+                    all_preds = []
+                    all_rsmes = []
+                    print("--> Initializing data...")
+                    print("--> Computing targets...")
+                    print(f"--> Training data...")
+                    print(f"--> Predicting data...")
+                    for j in n_simul_compare:
+                        # Generate data
+                        x_tr_j, y_tr_j, dydx_tr_j = generate_training_set(theo_model, instrument, True, j)
+                        # Compute targets
+                        spots_j, baskets_j, prices_j, deltas_j = generate_target_set(theo_model, instrument, j)
+                        all_baskets.append(baskets_j)
+                        all_prices.append(prices_j)
+                        # Train data, compute loss, predict data and calculare RMSE
+                        for i in diff_i:
+                            model_ij, loss_ij = train_model(x_tr_j, y_tr_j, dydx_tr_j, i, w_init, x_tr_j.size(1), y_tr_j.size(1), neurons, n_epochs, soft_beta, optimizer, seed)
+                            pred_ij = model_ij.predict(spots_j)
+                            rmse_ij = torch.sqrt(((pred_ij - prices_j) ** 2).mean())
+                            all_preds.append(pred_ij)
+                            all_rmses.append(rmse_ij)
+                    # Plot final results
+                    graph_compare(n_baskets, all_baskets, all_prices, all_preds, all_rsmes, diff_i, n_simul_compare, n_epochs, f"Seed {seed} - {type(theo_model).__name__} - {n_baskets} baskets - {n_stocks} stocks per bkt - {instrument} {maturity}y maturity")
+                    # Save results if not apply diff pca
+                    test = []
+                    test.append(f"% diff rmse: {round(((all_rmses[0] - all_rmses[1])  / all_rmses[1]).item()), 3}")
+                    df = pd.DataFrame(test)
+                    if save_results:
+                        df.to_excel("path")
+                        df.to_csv("path")
+                                
+        if mode == 'df_many_scenarios':
+            
+            # VARIABLES OF CHOICE
+            n_simul = [1024, 2048, 8192][0]
+            n_baskets = 1
+            n_stocks = 1
+            maturity = 1
+            n_steps = 1000 * maturity
+            seed_list = [1234, 5678, 9009, 8765, 4321]
+            layers = [15, 20, 25]
+            neuron_layers = [(n,) * i for i in range(2, max([i+1 for i in range(len(layer_size))]) + 1) for n in layer_size]
+            all_soft_betas = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+            diff_i = [True, False]
+                                
+            all_rmses = []
+            all_info = []
+            all_theo_models = [BachelieeModel(n_baskets, n_stocks, maturity, n_steps, seed),
+                               BlackNScholesModel(n_baskets, n_stocks, maturity, n_steps, seed)]
+            all_instruments = ['European call', 'European put']
+            all_w_init = ['xavier_unif', 'xavier_norm', 'kaiming_unif', 'kaiming_norm']
+            
+            for seed in seed_list:
+                for theo_model in all_theo_models:
+                    for instrument in all_instruments:
+                        for w_init in all_w_init:
+                            for neuron_size in neuron_layers:
+                                for soft_beta in all_soft_betas:
+                                    x_tr, y_tr, dydx_tr = generate_training_set(theo_model, instrument, True, n_simul)
+                                    spots, baskets, prices, deltas = generate_target_set(theo_model, instrument, n_simul)
+                                    # Run the experiment with the  current hyperparameters
+                                    for i in diff_i:
+                                        model_i, loss_i = train_model(x_tr, y_tr, dydx_tr, i, w_init, x_tr.size(1), y_tr.size(1), neurons, n_epochs, soft_beta, optimizer, seed)
+                                        pred_i = model_i.predict(spots)
+                                        rmse_i = torch.sqrt(((pred_i - prices) ** 2).mean())
+                                        all_rmses.append(rmse_i)
+                                    rmse_diff = round(((all_rmses[0] - all_rmses[1]) / all_rmses[1]).item, 4)
+                                    all_info.append({'seed': seed,
+                                                     'theo_model': str(type(theo_model).__name),
+                                                     'instr': instrument,
+                                                     'w_init': w_init,
+                                                     'layers': neuron_size,
+                                                     'soft_beta': round(soft_beta, 2),
+                                                     'diff rmse': rmse_diff})
+                                    print({'seed': seed,
+                                           'theo_model': str(type(theo_model).__name),
+                                           'instr': instrument,
+                                           'w_init': w_init,
+                                           'layers': neuron_size,
+                                           'soft_beta': round(soft_beta, 2),
+                                           'diff rmse': rmse_diff})
+            # Convert the list to a dataframe
+            df = pd.DataFrame(all_info)
+            print(df.head())
+            if save_results:
+                df.to_excel("path")
+                df.to_csv("path")
