@@ -2,4 +2,4 @@
 
 GOAL: Project to predict option pricing with Differential Machine Learning
 
-TYPE: Master thesis
+TYPE: Master's thesis
